@@ -17,7 +17,7 @@ from ledfx.config import save_config
 from ledfx.effects import Effect
 from ledfx.effects.math import ExpFilter
 from ledfx.effects.melbank import FFT_SIZE, MIC_RATE, Melbanks
-from ledfx.events import AudioDeviceChangeEvent, Event
+from ledfx.events import AudioDeviceChangeEvent, BpmUpdateEvent, Event
 from ledfx.sendspin import SENDSPIN_AVAILABLE
 from ledfx.sendspin.config import is_always_on as is_sendspin_always_on
 
@@ -1160,6 +1160,10 @@ class AudioAnalysisSource(AudioInputSource):
         self.subscribe(self.bar_oscillator)
         self.subscribe(self.volume_beat_now)
         self.subscribe(self.freq_power)
+        # fork addition: broadcast BPM to clients (e.g. ledfx-controller)
+        self._last_bpm_emit = 0.0
+        self._last_bpm_value = 0.0
+        self.subscribe(self.emit_bpm_event)
 
         # ensure any new analysis callbacks are above this line
         self._subscriber_threshold = len(self._callbacks)
@@ -1428,6 +1432,41 @@ class AudioAnalysisSource(AudioInputSource):
            oscillator
         """
         return self.bar_oscillator() % 1
+
+    def emit_bpm_event(self):
+        """Fork addition: broadcast detected BPM as a `bpm_update` event.
+
+        Called once per audio frame as a subscriber. Two throttles cooperate so
+        downstream WebSocket clients don't get flooded:
+          - hard cap: never emit more than every 0.5 s
+          - delta cap: only re-emit early if BPM moved by ≥0.5 BPM
+        After 5 s of stillness we re-emit anyway to act as a heartbeat for
+        late-joining clients.
+        """
+        # `bpm_beat_now` is @lru_cache'd within a frame, so calling it here is
+        # free if `bar_oscillator` already invoked it this frame.
+        self.bpm_beat_now()
+        try:
+            bpm = float(self._tempo.get_bpm())
+            confidence = float(self._tempo.get_confidence())
+        except Exception:
+            return
+        # Aubio returns 0 or garbage when there's no audio; skip.
+        if not (20.0 < bpm < 300.0):
+            return
+        now = time.time()
+        moved = abs(bpm - self._last_bpm_value) >= 0.5
+        heartbeat = now - self._last_bpm_emit >= 5.0
+        if now - self._last_bpm_emit < 0.5 and not heartbeat:
+            return
+        if not moved and not heartbeat:
+            return
+        self._last_bpm_emit = now
+        self._last_bpm_value = bpm
+        try:
+            self._ledfx.events.fire_event(BpmUpdateEvent(bpm, confidence))
+        except Exception as exc:  # pragma: no cover — defensive: event bus issues shouldn't kill audio
+            _LOGGER.warning("emit_bpm_event failed: %s", exc)
 
 
 @Effect.no_registration

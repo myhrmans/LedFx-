@@ -45,6 +45,10 @@ class Event:
     PLAYLIST_RESUMED = "playlist_resumed"
     COLORS_UPDATED = "colors_updated"
     SONG_DETECTED = "song_detected"
+    # fork addition: emitted by AudioAnalysisSource when the detected BPM
+    # changes meaningfully. Consumed by the ledfx-controller fork to sync
+    # autopilot / modulator beats to aubio's tempo detector.
+    BPM_UPDATE = "bpm_update"
 
     def __init__(self, type: str):
         """
@@ -60,6 +64,18 @@ class Event:
         Returns a dictionary representation of the event's attributes.
         """
         return self.__dict__
+
+
+class BpmUpdateEvent(Event):
+    """Fork addition: emitted by AudioAnalysisSource when the detected BPM
+    changes meaningfully. Throttled inside the emitter to ~2 Hz so the
+    WebSocket isn't spammed at full audio-frame cadence.
+    """
+
+    def __init__(self, bpm: float, confidence: float):
+        super().__init__(Event.BPM_UPDATE)
+        self.bpm = float(bpm)
+        self.confidence = float(confidence)
 
 
 class SongDetectedEvent(Event):
