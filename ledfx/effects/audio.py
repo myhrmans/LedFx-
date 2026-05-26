@@ -1161,9 +1161,20 @@ class AudioAnalysisSource(AudioInputSource):
         self.subscribe(self.volume_beat_now)
         self.subscribe(self.freq_power)
         # fork addition: broadcast BPM to clients (e.g. ledfx-controller)
+        # via the original WS event bus path. Kept during the transition to
+        # the ZMQ tick bus so non-controller WS subscribers don't break.
         self._last_bpm_emit = 0.0
         self._last_bpm_value = 0.0
         self.subscribe(self.emit_bpm_event)
+        # fork addition: ZMQ tick bus emitters. Tempo throttle is tighter
+        # than the WS path's (100 ms / 0.1 BPM) since msgpack/IPC is cheap
+        # and we want fast tempo-ramp tracking. Beat and onset have no
+        # throttle — aubio already gates them.
+        self._last_tempo_emit = 0.0
+        self._last_tempo_value = 0.0
+        self.subscribe(self.emit_tempo_event)
+        self.subscribe(self.emit_beat_event)
+        self.subscribe(self.emit_onset_event)
 
         # ensure any new analysis callbacks are above this line
         self._subscriber_threshold = len(self._callbacks)
@@ -1467,6 +1478,74 @@ class AudioAnalysisSource(AudioInputSource):
             self._ledfx.events.fire_event(BpmUpdateEvent(bpm, confidence))
         except Exception as exc:  # pragma: no cover — defensive: event bus issues shouldn't kill audio
             _LOGGER.warning("emit_bpm_event failed: %s", exc)
+
+    def emit_tempo_event(self):
+        """Fork addition: publish tempo to the ZMQ tick bus.
+
+        Same data as emit_bpm_event but on a faster cadence (100 ms / 0.1 BPM
+        delta, 5 s heartbeat). The controller's phase-anchor logic doesn't
+        depend on this — it derives phase from `beat` events — but consumers
+        like the autopilot policy "auto-after-beats" want a snappy tempo.
+        """
+        publisher = getattr(self._ledfx, "tick_publisher", None)
+        if publisher is None:
+            return
+        try:
+            bpm = float(self._tempo.get_bpm())
+            confidence = float(self._tempo.get_confidence())
+        except Exception:
+            return
+        if not (20.0 < bpm < 300.0):
+            return
+        now = time.time()
+        moved = abs(bpm - self._last_tempo_value) >= 0.1
+        heartbeat = now - self._last_tempo_emit >= 5.0
+        if now - self._last_tempo_emit < 0.1 and not heartbeat:
+            return
+        if not moved and not heartbeat:
+            return
+        self._last_tempo_emit = now
+        self._last_tempo_value = bpm
+        publisher.publish(
+            b"tempo", {"ts": now, "bpm": bpm, "confidence": confidence}
+        )
+
+    def emit_beat_event(self):
+        """Fork addition: fire per detected beat on the ZMQ tick bus.
+
+        Carries `bar_pos` (0..4 from `bar_oscillator()`) so the controller
+        can phase-lock its modulator beat counter to aubio's tempo tracker
+        with sub-beat precision, instead of free-running from wall time.
+        """
+        publisher = getattr(self._ledfx, "tick_publisher", None)
+        if publisher is None:
+            return
+        if not self.bpm_beat_now():
+            return
+        try:
+            bpm = float(self._tempo.get_bpm())
+            bar_pos = float(self.bar_oscillator())
+        except Exception:
+            return
+        if not (20.0 < bpm < 300.0):
+            return
+        publisher.publish(
+            b"beat", {"ts": time.time(), "bar_pos": bar_pos, "bpm": bpm}
+        )
+
+    def emit_onset_event(self):
+        """Fork addition: fire per detected onset (percussive transient).
+
+        Distinct from `beat` — onsets fire on any transient (kick, snare,
+        clap), beats only fire on the tempo grid. Useful for "fire on hit"
+        triggers in the controller.
+        """
+        publisher = getattr(self._ledfx, "tick_publisher", None)
+        if publisher is None:
+            return
+        if not self.onset():
+            return
+        publisher.publish(b"onset", {"ts": time.time()})
 
 
 @Effect.no_registration

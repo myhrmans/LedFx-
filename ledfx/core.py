@@ -46,6 +46,7 @@ from ledfx.playlists import PlaylistManager
 from ledfx.presets import ledfx_presets
 from ledfx.scenes import Scenes
 from ledfx.sendspin.config import eager_start as sendspin_eager_start
+from ledfx.tick_publisher import TickPublisher
 from ledfx.tools.ts_generator import generate_typescript_types
 from ledfx.utils import (
     RollingQueueHandler,
@@ -145,6 +146,9 @@ class LedFxCore:
 
         self.setup_logqueue()
         self.events = Events(self)
+        # fork addition: ZeroMQ tick bus for low-latency audio events. The
+        # publisher self-stops on LedFxShutdownEvent so we only need to start it.
+        self.tick_publisher = TickPublisher(self)
         self.setup_visualisation_events()
         self.events.add_listener(
             self.handle_base_configuration_update, Event.BASE_CONFIG_UPDATE
@@ -466,6 +470,13 @@ class LedFxCore:
         _LOGGER.info(
             "Starting LedFx, listening on %s:%s", self.host, self.port
         )
+
+        # fork addition: bring up tick bus before any audio source so emitters
+        # have a publisher to push to. Self-stops on LedFxShutdownEvent.
+        try:
+            self.tick_publisher.start()
+        except Exception as exc:
+            _LOGGER.warning("TickPublisher failed to start: %s", exc)
 
         if (
             self.icon is not None
